@@ -1,16 +1,20 @@
-package bbolt
+package bolt
 
 import (
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"log"
+	"math/rand"
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 	"unsafe"
+
+	"github.com/jsnathan/deadlocks"
 )
 
 // The largest step that can be taken when remapping the mmap.
@@ -105,7 +109,8 @@ type DB struct {
 
 	path     string
 	file     *os.File
-	dataref  []byte // mmap'ed readonly, write throws SEGV
+	lockfile *os.File // windows only
+	dataref  []byte   // mmap'ed readonly, write throws SEGV
 	data     *[maxMapSize]byte
 	datasz   int
 	filesz   int // current on disk file size
@@ -122,13 +127,13 @@ type DB struct {
 
 	pagePool sync.Pool
 
-	batchMu sync.Mutex
+	batchMu deadlocks.Mutex
 	batch   *batch
 
-	rwlock   sync.Mutex   // Allows only one writer at a time.
-	metalock sync.Mutex   // Protects meta page access.
-	mmaplock sync.RWMutex // Protects mmap access during remapping.
-	statlock sync.RWMutex // Protects stats access.
+	rwlock   deadlocks.Mutex   // Allows only one writer at a time.
+	metalock deadlocks.Mutex   // Protects meta page access.
+	mmaplock deadlocks.RWMutex // Protects mmap access during remapping.
+	statlock deadlocks.RWMutex // Protects stats access.
 
 	ops struct {
 		writeAt func(b []byte, off int64) (n int, err error)
@@ -161,6 +166,15 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	db := &DB{
 		opened: true,
 	}
+
+	// Deadlock detection sentinels
+	r := "-" + strconv.Itoa(rand.Intn(10000000))
+	db.rwlock = deadlocks.Sentinel("bolt-rwlock" + r)
+	db.metalock = deadlocks.Sentinel("bolt-metalock" + r)
+	db.mmaplock = deadlocks.Sentinel("bolt-mmaplock" + r)
+	db.statlock = deadlocks.Sentinel("bolt-statlock" + r)
+	db.batchMu = deadlocks.Sentinel("bolt-batchMu-lock" + r)
+
 	// Set default options if no options are provided.
 	if options == nil {
 		options = DefaultOptions
@@ -196,7 +210,8 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	// if !options.ReadOnly.
 	// The database file is locked using the shared lock (more than one process may
 	// hold a lock at the same time) otherwise (options.ReadOnly is set).
-	if err := flock(db, !db.readOnly, options.Timeout); err != nil {
+	if err := flock(db, mode, !db.readOnly, options.Timeout); err != nil {
+		db.lockfile = nil // make 'unused' happy. TODO: rework locks
 		_ = db.close()
 		return nil, err
 	}
@@ -452,8 +467,8 @@ func (db *DB) Close() error {
 	db.metalock.Lock()
 	defer db.metalock.Unlock()
 
-	db.mmaplock.Lock()
-	defer db.mmaplock.Unlock()
+	db.mmaplock.RLock()
+	defer db.mmaplock.RUnlock()
 
 	return db.close()
 }
